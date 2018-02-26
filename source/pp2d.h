@@ -109,7 +109,7 @@ typedef enum {
 } flipType_t;
 
 typedef struct { 
-    float x, y, z; 
+    float x, y; 
     float u, v;
 } vertex_s;
 

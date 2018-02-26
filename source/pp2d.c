@@ -76,7 +76,6 @@ static struct {
     float scaleX;
     float scaleY;
     float angle;
-    float depth;
     bool initialized;
 } pp2dBuffer;
 
@@ -92,18 +91,17 @@ static struct {
     GPU_TEXTURE_FILTER_PARAM minFilter;
 } textureFilters;
 
-static void pp2d_add_text_vertex(float vx, float vy, float vz, float tx, float ty);
+static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty);
 static void pp2d_draw_unprocessed_queue(void);
 static void pp2d_get_text_size_internal(float* width, float* height, float scaleX, float scaleY, int wrapX, const char* text);
 static void pp2d_set_rendered_flags(bool texture, bool text, bool rectangle);
 static void pp2d_set_text_color(u32 color);
 
-static void pp2d_add_text_vertex(float vx, float vy, float vz, float tx, float ty)
+static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty)
 {
     vertex_s* vtx = &vertexData.vbo[vertexData.cur++];
     vtx->x = vx;
     vtx->y = vy;
-    vtx->z = vz;
     vtx->u = tx;
     vtx->v = ty;
 }
@@ -133,12 +131,12 @@ void pp2d_draw_rectangle(int x, int y, int width, int height, u32 color)
         C3D_TexEnvColor(env, color);
     }
 
-    pp2d_add_text_vertex(        x,          y, PP2D_DEFAULT_DEPTH, 0, 0);
-    pp2d_add_text_vertex(        x, y + height, PP2D_DEFAULT_DEPTH, 0, 0);
-    pp2d_add_text_vertex(x + width,          y, PP2D_DEFAULT_DEPTH, 0, 0);
-    pp2d_add_text_vertex(x + width,          y, PP2D_DEFAULT_DEPTH, 0, 0);
-    pp2d_add_text_vertex(        x, y + height, PP2D_DEFAULT_DEPTH, 0, 0);
-    pp2d_add_text_vertex(x + width, y + height, PP2D_DEFAULT_DEPTH, 0, 0);
+    pp2d_add_text_vertex(        x,          y, 0, 0);
+    pp2d_add_text_vertex(        x, y + height, 0, 0);
+    pp2d_add_text_vertex(x + width,          y, 0, 0);
+    pp2d_add_text_vertex(x + width,          y, 0, 0);
+    pp2d_add_text_vertex(        x, y + height, 0, 0);
+    pp2d_add_text_vertex(x + width, y + height, 0, 0);
     pp2d_draw_arrays();
 
     pp2d_set_rendered_flags(false, false, true);
@@ -216,12 +214,12 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
                 pp2d_set_text_color(color);
             }
 
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    PP2D_DEFAULT_DEPTH, data.texcoord.left,  data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, PP2D_DEFAULT_DEPTH, data.texcoord.left,  data.texcoord.bottom);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    PP2D_DEFAULT_DEPTH, data.texcoord.right, data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    PP2D_DEFAULT_DEPTH, data.texcoord.right, data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, PP2D_DEFAULT_DEPTH, data.texcoord.left,  data.texcoord.bottom);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, PP2D_DEFAULT_DEPTH, data.texcoord.right, data.texcoord.bottom);
+            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
+            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
             pp2d_draw_arrays();
 
             x += data.xAdvance;
@@ -427,14 +425,14 @@ void pp2d_init(void)
     
     C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
     AttrInfo_Init(attrInfo);
-    AttrInfo_AddLoader(attrInfo, 0, GPU_FLOAT, 3);
+    AttrInfo_AddLoader(attrInfo, 0, GPU_FLOAT, 2);
     AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2);
 
     Mtx_OrthoTilt(&projectionTopLeft, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
     Mtx_OrthoTilt(&projectionTopRight, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
     Mtx_OrthoTilt(&projectionBot, 0, PP2D_SCREEN_BOTTOM_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
     
-    C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_ALL);
+    C3D_DepthTest(false, GPU_GEQUAL, GPU_WRITE_ALL);
 
     fontEnsureMapped();
     TGLP_s* glyphInfo = fontGetGlyphInfo();
@@ -616,18 +614,12 @@ void pp2d_texture_select_part(size_t id, int x, int y, int xbegin, int ybegin, i
     pp2dBuffer.scaleX = 1;
     pp2dBuffer.scaleY = 1;
     pp2dBuffer.angle = 0;
-    pp2dBuffer.depth = PP2D_DEFAULT_DEPTH;
     pp2dBuffer.initialized = true;
 }
 
 void pp2d_texture_blend(u32 color)
 {
     pp2dBuffer.color = color;
-}
-
-void pp2d_texture_depth(float depth)
-{
-    pp2dBuffer.depth = depth;
 }
 
 void pp2d_texture_flip(flipType_t fliptype)
@@ -724,12 +716,12 @@ void pp2d_texture_queue(void)
     }
 
     // rendering
-    pp2d_add_text_vertex(vert[0][0], vert[0][1], pp2dBuffer.depth, left, top);
-    pp2d_add_text_vertex(vert[1][0], vert[1][1], pp2dBuffer.depth, left, bottom);
-    pp2d_add_text_vertex(vert[2][0], vert[2][1], pp2dBuffer.depth, right, top);
-    pp2d_add_text_vertex(vert[3][0], vert[3][1], pp2dBuffer.depth, right, top);
-    pp2d_add_text_vertex(vert[4][0], vert[4][1], pp2dBuffer.depth, left, bottom);
-    pp2d_add_text_vertex(vert[5][0], vert[5][1], pp2dBuffer.depth, right, bottom);
+    pp2d_add_text_vertex(vert[0][0], vert[0][1], left, top);
+    pp2d_add_text_vertex(vert[1][0], vert[1][1], left, bottom);
+    pp2d_add_text_vertex(vert[2][0], vert[2][1], right, top);
+    pp2d_add_text_vertex(vert[3][0], vert[3][1], right, top);
+    pp2d_add_text_vertex(vert[4][0], vert[4][1], left, bottom);
+    pp2d_add_text_vertex(vert[5][0], vert[5][1], right, bottom);
 
     pp2d_set_rendered_flags(true, false, false);
 }
