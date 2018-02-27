@@ -91,11 +91,136 @@ static struct {
     GPU_TEXTURE_FILTER_PARAM minFilter;
 } textureFilters;
 
+// Cached glyph data
+typedef struct {
+    u8 left;       ///< Horizontal offset to draw the glyph with.
+    u8 glyphWidth; ///< Width of the glyph.
+    u8 charWidth;  ///< Width of the character, that is, horizontal distance to advance.
+
+    struct {
+        float left;
+        float right;
+        float top;
+        float bottom;
+    } texcoords; ///< Texcoords in the glyphsheet
+} cachedGlyph_s;
+
+// Cached sysfont
+static struct {
+    u8 cellWidth;    ///< Width of a glyph cell.
+    u8 cellHeight;   ///< Height of a glyph cell.
+    u8 baselinePos;  ///< Vertical position of the baseline.
+    C3D_Tex tex;
+    cachedGlyph_s glyphs[128]; ///< Cache the ascii table
+}   g_sysfontCached;
+
 static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty);
 static void pp2d_draw_unprocessed_queue(void);
 static void pp2d_get_text_size_internal(float* width, float* height, float scaleX, float scaleY, int wrapX, const char* text);
 static void pp2d_set_rendered_flags(bool texture, bool text, bool rectangle);
 static void pp2d_set_text_color(u32 color);
+
+static void pp2d_cache_glyphs(void)
+{
+    TGLP_s              *TGLP = fontGetGlyphInfo();
+    C3D_RenderTarget    *target;
+    C3D_TexEnv          *env;
+    C3D_Tex             *tex = &g_sysfontCached.tex;
+    C3D_Mtx             projection;
+    fontGlyphPos_s      data;
+    float               left = 0.f;
+    float               top = 0.f;
+
+    // Init texture for the cache (8 rows of 16 glyphs => 128 glyphs capacity)
+    C3D_TexInit(tex, 16 * TGLP->cellWidth, 8 * TGLP->cellHeight, GPU_RB_RGBA4);
+    tex->param = GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR)
+    | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
+    tex->border = 0;
+    tex->lodParam = 0;
+
+    // Init projection & apply it to vtx shader
+    Mtx_Ortho(&projection, 0.f, tex->width, tex->height, 0.f, 0.f, 1.f, true);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_projection, &projection);
+
+    // Init render target
+    target = C3D_RenderTargetCreateFromTex(tex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24);
+
+    // Clear texture
+    C3D_FrameBufClear(&target->frameBuf, C3D_CLEAR_ALL, 0, 0);
+
+    // Init C3D rendering
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C3D_FrameDrawOn(target);
+    vertexData.cur = 0;
+    vertexData.old = 0;
+
+    // Set rendering options
+    env = C3D_GetTexEnv(0);
+    C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, 0, 0);
+    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_CONSTANT, 0);
+    C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
+    C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE); ///< Only the alpha is needed actually
+    C3D_TexEnvColor(env, 0);
+
+    // Init sysfont's globals
+    g_sysfontCached.cellWidth = TGLP->cellWidth;
+    g_sysfontCached.cellHeight = TGLP->cellHeight;
+    g_sysfontCached.baselinePos = TGLP->baselinePos;
+
+    // Parse the sysfont and cache the glyphs
+    for (u32 i = 0; i < 128; ++i)
+    {
+        if (i && !(i % 16))
+        {
+            top += TGLP->cellHeight;
+            left = 0.f;
+        }
+        else if (i > 0)
+            left += TGLP->cellWidth;
+
+        int     glyphIdx = fontGlyphIndexFromCodePoint(i);
+        charWidthInfo_s *cwi = fontGetCharWidthInfo(glyphIdx);
+        cachedGlyph_s   *glyph = &g_sysfontCached.glyphs[i];
+
+        fontCalcGlyphPos(&data, glyphIdx, GLYPH_POS_CALC_VTXCOORD, 1.f, 1.f);
+
+        glyph->left = cwi->left;
+        glyph->charWidth = cwi->charWidth;
+        glyph->glyphWidth = cwi->glyphWidth;
+
+        float tx = left / (float)tex->width;
+        float ty = 1.0f - top / (float)tex->height;
+        float tw = (float)(cwi->glyphWidth) / (float)tex->width;
+        float th = (float)(TGLP->cellHeight) / (float)tex->height;
+
+        glyph->texcoords.left = tx;
+        glyph->texcoords.right = tx + tw;
+        glyph->texcoords.top = ty;
+        glyph->texcoords.bottom = ty - th;
+
+        C3D_TexBind(0, &glyphSheets[data.sheetIndex]);
+
+        data.vtxcoord.left = 0.f;
+        data.vtxcoord.right = glyph->glyphWidth;
+        data.vtxcoord.top = 0.f;
+        data.vtxcoord.bottom = TGLP->cellHeight;
+
+        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
+        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+
+        pp2d_draw_arrays();
+    }
+
+    // End rendering
+    C3D_FrameEnd(0);
+
+    // Delete render target
+    C3D_RenderTargetDelete(target);
+}
 
 static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty)
 {
@@ -137,6 +262,7 @@ void pp2d_draw_rectangle(int x, int y, int width, int height, u32 color)
     pp2d_add_text_vertex(x + width,          y, 0, 0);
     pp2d_add_text_vertex(        x, y + height, 0, 0);
     pp2d_add_text_vertex(x + width, y + height, 0, 0);
+
     pp2d_draw_arrays();
 
     pp2d_set_rendered_flags(false, false, true);
@@ -170,7 +296,14 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
     
     scaleX *= s_textScale;
     scaleY *= s_textScale;
-    
+    lastSheet = -1;
+
+    if (color != prevColor || renderedRectangle || renderedTexture)
+    {
+        prevColor = color;
+        pp2d_set_text_color(color);
+    }
+
     do
     {
         if (!*p) 
@@ -197,35 +330,72 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
             {
                 break;
             }
-            
-            int glyphIdx = fontGlyphIndexFromCodePoint(code);
-            fontGlyphPos_s data;
-            fontCalcGlyphPos(&data, glyphIdx, GLYPH_POS_CALC_VTXCOORD, scaleX, scaleY);
 
-            if (data.sheetIndex != lastSheet)
+            if (code < 128)
             {
-                lastSheet = data.sheetIndex;
-                C3D_TexBind(0, &glyphSheets[lastSheet]);
-            }
+                if (lastSheet != -2)
+                {
+                    pp2d_draw_unprocessed_queue();
+                    C3D_TexBind(0, &g_sysfontCached.tex);
+                    lastSheet = -2;
+                }
 
-            if (color != prevColor || renderedRectangle || renderedTexture)
+                cachedGlyph_s   *glyph = &g_sysfontCached.glyphs[code];
+
+                struct
+                {
+                    float left;
+                    float right;
+                    float top;
+                    float bottom;
+                } vtxcoord;
+
+                float vx = scaleX * (float)glyph->left;
+                float vy = 0.f;
+                float vw = scaleX * (float)glyph->glyphWidth;
+                float vh = scaleY * (float)g_sysfontCached.cellHeight;
+
+                vy = -vy;
+                vtxcoord.left = vx;
+                vtxcoord.top = vy;
+                vtxcoord.right = vx+vw;
+                vtxcoord.bottom = vy+vh;
+
+                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.top,    glyph->texcoords.left,  glyph->texcoords.top);
+                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);
+                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
+                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
+                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);
+                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.bottom, glyph->texcoords.right, glyph->texcoords.bottom);
+
+                x += (float)glyph->charWidth * scaleX;
+            }
+            else
             {
-                prevColor = color;
-                pp2d_set_text_color(color);
+                int glyphIdx = fontGlyphIndexFromCodePoint(code);
+                fontGlyphPos_s data;
+                fontCalcGlyphPos(&data, glyphIdx, GLYPH_POS_CALC_VTXCOORD, scaleX, scaleY);
+
+                if (data.sheetIndex != lastSheet)
+                {
+                    lastSheet = data.sheetIndex;
+                    pp2d_draw_unprocessed_queue();
+                    C3D_TexBind(0, &glyphSheets[lastSheet]);
+                }
+
+                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
+                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
+                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+
+                x += data.xAdvance;
             }
-
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
-            pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-            pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
-            pp2d_draw_arrays();
-
-            x += data.xAdvance;
         }
     } while (code > 0);
 
+    pp2d_draw_unprocessed_queue();
     pp2d_set_rendered_flags(false, true, false);
 }
 
@@ -275,7 +445,7 @@ void pp2d_frame_begin(gfxScreen_t target, gfx3dSide_t side)
 void pp2d_frame_draw_on(gfxScreen_t target, gfx3dSide_t side)
 {
     pp2d_draw_unprocessed_queue();
-    
+
     if (target == GFX_TOP)
     {
         C3D_FrameDrawOn(side == GFX_LEFT ? topLeft : topRight);
@@ -458,6 +628,8 @@ void pp2d_init(void)
     C3D_BufInfo* bufInfo = C3D_GetBufInfo();
     BufInfo_Init(bufInfo);
     BufInfo_Add(bufInfo, vertexData.vbo, sizeof(vertex_s), 2, 0x10);
+
+    pp2d_cache_glyphs();
 
     prevColor = 0;
     prevSpritesheet = PP2D_MAX_TEXTURES;

@@ -88,7 +88,10 @@ int main()
     
     // set the screen background color
     pp2d_set_screen_color(GFX_TOP, ABGR8(255, 10, 10, 10));
-    
+    pp2d_set_screen_color(GFX_BOTTOM, ABGR8(255, 0x20, 0x20, 0x20));
+
+    const float h = pp2d_get_text_height("a", 0.5f, 0.5f);
+
     while (aptMainLoop() && !(hidKeysDown() & KEY_START))
     {
         // read inputs
@@ -105,11 +108,12 @@ int main()
         
         if (moving)
         {
-            updateSprites(); 
+            updateSprites();
         }
 
         //begin a frame. this needs to be called once per frame, not once per screen
         pp2d_frame_begin(GFX_TOP, GFX_LEFT);
+
             // draw our sprites
             for (size_t i = 0; i < n; i++)
             {
@@ -118,9 +122,9 @@ int main()
 
         // change screen
         pp2d_frame_draw_on(GFX_BOTTOM, GFX_LEFT);
-            // draws a rectangle
-            pp2d_draw_rectangle(0, 0, PP2D_SCREEN_BOTTOM_WIDTH, PP2D_SCREEN_HEIGHT, RGBA8(0x20, 0x20, 0x20, 0xFF));
 
+            // draws a rectangle
+            //pp2d_draw_rectangle(0, 0, PP2D_SCREEN_BOTTOM_WIDTH, PP2D_SCREEN_HEIGHT, RGBA8(0x20, 0x20, 0x20, 0xFF)); ///< Use clear color instead ?
             pp2d_draw_rectangle(20, 160, 80, 50, blending ? RGBA8(0, 0xFF, 0, 0xFF) : RGBA8(0xFE, 0xFE, 0xFE, 0xFF));
             pp2d_draw_rectangle(120, 160, 80, 50, rotating ? RGBA8(0, 0xFF, 0, 0xFF) : RGBA8(0xFE, 0xFE, 0xFE, 0xFF));
             pp2d_draw_rectangle(220, 160, 80, 50, moving ? RGBA8(0, 0xFF, 0, 0xFF) : RGBA8(0xFE, 0xFE, 0xFE, 0xFF));
@@ -129,7 +133,6 @@ int main()
             pp2d_draw_text(135, 178, 0.5f, 0.5f, rotating ? RGBA8(0, 0, 0, 0xFF) : RGBA8(0, 0, 0, 0xFF), "Rotating");
             pp2d_draw_text(237, 178, 0.5f, 0.5f, moving ? RGBA8(0, 0, 0, 0xFF) : RGBA8(0, 0, 0, 0xFF), "Moving");
 
-            const float h = pp2d_get_text_height("a", 0.5f, 0.5f);
             pp2d_draw_textf(2, 2, 0.5f, 0.5f, RGBA8(0xFE, 0xFE, 0xFE, 0xFF), "Rendering %d/%d sprites in VBO mode", n, MAX_SPRITES);
             pp2d_draw_text(2, 2 + h, 0.5f, 0.5f, RGBA8(0xFE, 0xFE, 0xFE, 0xFF), "CPU:");
             pp2d_draw_text(2, 2 + h*2, 0.5f, 0.5f, RGBA8(0xFE, 0xFE, 0xFE, 0xFF), "GPU:");
