@@ -42,34 +42,44 @@ void initSprites(void)
     {
         sprites[i].x = rand() % (PP2D_SCREEN_TOP_WIDTH - 32);
         sprites[i].y = rand() % (PP2D_SCREEN_HEIGHT - 32);
-        sprites[i].dx = rand()*4.0f/RAND_MAX - 2.0f;
-        sprites[i].dy = rand()*4.0f/RAND_MAX - 2.0f;
+        sprites[i].dx = rand() % 50;
+        sprites[i].dy = rand() % 50;
         sprites[i].angle = rand() % 360;
         sprites[i].color = RGBA8(rand() % 0xFF, rand() % 0xFF,rand() % 0xFF,rand() % 0xFF);
         sprites[i].id = rand() & 3;
     }
 }
 
-void updateSprites(void)
+void updateSprites(float delta)
 {
     for (size_t i = 0; i < n; i++)
     {
-        sprites[i].x += sprites[i].dx;
-        sprites[i].y += sprites[i].dy;
-
-        //check for collision with the screen boundaries
-        if ((sprites[i].x < 1) || (sprites[i].x > PP2D_SCREEN_TOP_WIDTH - 32))
+        if (moving)
         {
-            sprites[i].dx = -sprites[i].dx;
-        }
+            sprites[i].x += sprites[i].dx * delta;
+            sprites[i].y += sprites[i].dy * delta;
 
-        if ((sprites[i].y < 1) || (sprites[i].y > PP2D_SCREEN_HEIGHT - 32))
-        {
-            sprites[i].dy = -sprites[i].dy;
-        }
+            //check for collision with the screen boundaries
+            if ((sprites[i].x < 1) || (sprites[i].x > PP2D_SCREEN_TOP_WIDTH - 32))
+            {
+                sprites[i].dx = -sprites[i].dx;
+            }
 
-        sprites[i].angle++;
+            if ((sprites[i].y < 1) || (sprites[i].y > PP2D_SCREEN_HEIGHT - 32))
+            {
+                sprites[i].dy = -sprites[i].dy;
+            }
+        }
+        if (rotating)
+            sprites[i].angle += 180.f * delta;
     }
+}
+
+float   GetTimeAsSeconds(void)
+{
+    #define TICKS_PER_SEC 268123480
+
+    return (float)((float)svcGetSystemTick()/(float)TICKS_PER_SEC);
 }
 
 int main()
@@ -92,8 +102,14 @@ int main()
 
     const float h = pp2d_get_text_height("a", 0.5f, 0.5f);
 
+    float delta;
+    float lastTime = GetTimeAsSeconds();
     while (aptMainLoop() && !(hidKeysDown() & KEY_START))
     {
+        delta = lastTime;
+        lastTime = GetTimeAsSeconds();
+        delta = lastTime - delta;
+
         // read inputs
         touchPosition touch;
         hidScanInput();
@@ -106,10 +122,7 @@ int main()
         else if (hidKeysDown() & KEY_TOUCH && touch.px >= 120 && touch.px <= 200 && touch.py >= 160 && touch.py <= 210) rotating = !rotating;
         else if (hidKeysDown() & KEY_TOUCH && touch.px >= 220 && touch.px <= 300 && touch.py >= 160 && touch.py <= 210) moving = !moving;
         
-        if (moving)
-        {
-            updateSprites();
-        }
+        updateSprites(delta);
 
         //begin a frame. this needs to be called once per frame, not once per screen
         pp2d_frame_begin(GFX_TOP, GFX_LEFT);
