@@ -50,9 +50,10 @@ static int lastSheet = -1;
 
 // vbo buffer and positions
 static struct {
-    size_t cur;
-    size_t old;
-    vertex_s* vbo;
+    size_t      cur;
+    size_t      old;
+    u32         primitive;
+    vertex_s*   vbo;
 } vertexData;
 
 // texture buffer
@@ -114,11 +115,25 @@ static struct {
     cachedGlyph_s glyphs[128]; ///< Cache the ascii table
 }   g_sysfontCached;
 
+static void pp2d_use_primitive(GPU_Primitive_t primitive);
 static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty);
 static void pp2d_draw_unprocessed_queue(void);
 static void pp2d_get_text_size_internal(float* width, float* height, float scaleX, float scaleY, int wrapX, const char* text);
 static void pp2d_set_rendered_flags(bool texture, bool text, bool rectangle);
 static void pp2d_set_text_color(u32 color);
+
+static u32 nextPow2(u32 v)
+{
+    #define TEX_MIN_SIZE 64
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v++;
+    return (v >= TEX_MIN_SIZE ? v : TEX_MIN_SIZE);
+}
 
 static void pp2d_cache_glyphs(void)
 {
@@ -132,9 +147,9 @@ static void pp2d_cache_glyphs(void)
     float               top = 0.f;
 
     // Init texture for the cache (8 rows of 16 glyphs => 128 glyphs capacity)
-    C3D_TexInit(tex, 16 * TGLP->cellWidth, 8 * TGLP->cellHeight, GPU_RB_RGBA4);
+    C3D_TexInit(tex, nextPow2(16 * TGLP->cellWidth), nextPow2(8 * TGLP->cellHeight), GPU_RB_RGBA4);
     tex->param = GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR)
-    | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
+    | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_BORDER) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_BORDER);
     tex->border = 0;
     tex->lodParam = 0;
 
@@ -161,6 +176,9 @@ static void pp2d_cache_glyphs(void)
     C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
     C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE); ///< Only the alpha is needed actually
     C3D_TexEnvColor(env, 0);
+
+    // Set primitive mode
+    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
 
     // Init sysfont's globals
     g_sysfontCached.cellWidth = TGLP->cellWidth;
@@ -205,12 +223,10 @@ static void pp2d_cache_glyphs(void)
         data.vtxcoord.top = 0.f;
         data.vtxcoord.bottom = TGLP->cellHeight;
 
-        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
-        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
-        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
-        pp2d_add_text_vertex(left+data.vtxcoord.left,  top+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-        pp2d_add_text_vertex(left+data.vtxcoord.right, top+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+        pp2d_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.bottom, data.texcoord.left, data.texcoord.bottom);
+        pp2d_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+        pp2d_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.top, data.texcoord.left, data.texcoord.top);
+        pp2d_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.top, data.texcoord.right, data.texcoord.top);
 
         pp2d_draw_arrays();
     }
@@ -233,13 +249,33 @@ static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty)
 
 void pp2d_draw_arrays(void)
 {
-    C3D_DrawArrays(GPU_TRIANGLES, vertexData.old, vertexData.cur - vertexData.old);
+    C3D_DrawArrays(vertexData.primitive, vertexData.old, vertexData.cur - vertexData.old);
     vertexData.old = vertexData.cur;
+}
+
+static void pp2d_use_primitive(GPU_Primitive_t primitive)
+{
+    // If new primitive type is different, render what's in the queue before switching
+    if (vertexData.primitive != primitive)
+        pp2d_draw_unprocessed_queue();
+
+    vertexData.primitive = primitive;
+}
+
+static void pp2d_draw_unprocessed_queue(void)
+{
+    if (vertexData.cur != vertexData.old)
+    {
+        pp2d_draw_arrays();
+    }
 }
 
 void pp2d_draw_rectangle(int x, int y, int width, int height, u32 color)
 {
     pp2d_draw_unprocessed_queue();
+
+    // Set primitive mode
+    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
 
     if (vertexData.cur + 6 > PP2D_MAX_VERTICES)
     {
@@ -256,12 +292,10 @@ void pp2d_draw_rectangle(int x, int y, int width, int height, u32 color)
         C3D_TexEnvColor(env, color);
     }
 
-    pp2d_add_text_vertex(        x,          y, 0, 0);
-    pp2d_add_text_vertex(        x, y + height, 0, 0);
-    pp2d_add_text_vertex(x + width,          y, 0, 0);
-    pp2d_add_text_vertex(x + width,          y, 0, 0);
     pp2d_add_text_vertex(        x, y + height, 0, 0);
     pp2d_add_text_vertex(x + width, y + height, 0, 0);
+    pp2d_add_text_vertex(        x,          y, 0, 0);
+    pp2d_add_text_vertex(x + width,          y, 0, 0);
 
     pp2d_draw_arrays();
 
@@ -287,7 +321,11 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
         return;
     }
 
+    // Render queue
     pp2d_draw_unprocessed_queue();
+
+    // Set primitive mode
+    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
 
     ssize_t  units;
     uint32_t code;
@@ -361,12 +399,11 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
                 vtxcoord.right = vx+vw;
                 vtxcoord.bottom = vy+vh;
 
-                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.top,    glyph->texcoords.left,  glyph->texcoords.top);
-                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);
-                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
-                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
-                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);
+                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);                
                 pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.bottom, glyph->texcoords.right, glyph->texcoords.bottom);
+                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.top,    glyph->texcoords.left,  glyph->texcoords.top);
+                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
+                
 
                 x += (float)glyph->charWidth * scaleX;
             }
@@ -383,12 +420,10 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
                     C3D_TexBind(0, &glyphSheets[lastSheet]);
                 }
 
-                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
-                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
-                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);
                 pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
                 pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
+                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);                
 
                 x += data.xAdvance;
             }
@@ -407,14 +442,6 @@ void pp2d_draw_textf(float x, float y, float scaleX, float scaleY, u32 color, co
     vsnprintf(buffer, 256, text, args);
     pp2d_draw_text(x, y, scaleX, scaleY, color, buffer);
     va_end(args);
-}
-
-static void pp2d_draw_unprocessed_queue(void)
-{
-    if (vertexData.cur != vertexData.old)
-    {
-        pp2d_draw_arrays();
-    }
 }
 
 void pp2d_exit(void)
@@ -808,6 +835,9 @@ void pp2d_texture_queue(void)
     
     size_t id = pp2dBuffer.id;
     
+    // Set primitive mode
+    pp2d_use_primitive(GPU_TRIANGLES);
+
     float left = (float)pp2dBuffer.xbegin / (float)textures[id].tex.width;
     float right = (float)(pp2dBuffer.xbegin + pp2dBuffer.width) / (float)textures[id].tex.width;
     float top = (float)(textures[id].tex.height - pp2dBuffer.ybegin) / (float)textures[id].tex.height;

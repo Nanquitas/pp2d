@@ -113,7 +113,7 @@ typedef struct {
     float u, v;
 } vertex_s;
 
-/// Draws queued verticies 
+/// Draws queued vertices
 void pp2d_draw_arrays(void);
 
 /**
