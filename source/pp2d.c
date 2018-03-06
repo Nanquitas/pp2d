@@ -28,99 +28,226 @@
 
 #include "pp2d.h"
 
-// shader
-static DVLB_s* vshader_dvlb;
-static shaderProgram_s program;
-static int uLoc_projection;
+/*
+ * Internal structs
+ */
 
-// targets
-static C3D_RenderTarget* topLeft;
-static C3D_RenderTarget* topRight;
-static C3D_RenderTarget* bot;
+// Vertex
+typedef struct
+{ 
+    float x, y; 
+    float u, v;
+}   PP2Di_Vertex;
 
-// projection matrices
-static C3D_Mtx projectionTopLeft;
-static C3D_Mtx projectionTopRight;
-static C3D_Mtx projectionBot;
+// Vbo buffer and positions
+typedef struct
+{
+    u32              startPos;
+    u32              currentPos;
+    GPU_Primitive_t  primitive;
+    PP2Di_Vertex *   data;
+}   PP2Di_Vbo;
 
-// text data
-static C3D_Tex* glyphSheets;
-static float s_textScale;
-static int lastSheet = -1;
+// Tex env settings
+typedef enum
+{
+    NONE,
+    TEXTURE_BLENDING,   ///< Apply a texture to a target (blending through alpha)
+    MIX_COLOR_AND_TEXTURE, ///< Blend a color using texture's alpha
+    COLOR_BLENDING,     ///< Blend a color using the color's alpha component
+}   PP2Di_TexEnvType;
 
-// vbo buffer and positions
-static struct {
-    size_t      cur;
-    size_t      old;
-    u32         primitive;
-    vertex_s*   vbo;
-} vertexData;
+typedef struct
+{
+    C3D_TexEnv  textureBlending;
+    C3D_TexEnv  mixColorAndTexture;
+    C3D_TexEnv  colorBlending;
 
-// texture buffer
-static struct {
-    C3D_Tex tex;
-    u32 width;
-    u32 height;
-    bool allocated;
-} textures[PP2D_MAX_TEXTURES];
+    PP2Di_TexEnvType    current;
+}   PP2Di_TexEnv;
 
-static struct {
-    size_t id;
-    int x;
-    int y;
-    int xbegin;
-    int ybegin;
-    int width;
-    int height;
-    u32 color;
-    flipType_t fliptype;
-    float scaleX;
-    float scaleY;
-    float angle;
-    bool initialized;
-} pp2dBuffer;
+// Targets
+typedef struct
+{
+    C3D_RenderTarget *  topLeft;
+    C3D_RenderTarget *  topRight;
+    C3D_RenderTarget *  bottom;
+}   PP2Di_Targets;
 
-static u32 prevColor;
-static size_t prevSpritesheet;
-static bool renderedText;
-static bool renderedRectangle;
-static bool renderedTexture;
+// Shader
+typedef struct
+{
+    DVLB_s *            vshaderDvlb;
+    shaderProgram_s     program;
+    int                 projectionLocation;
+}   PP2Di_Shader;
 
-// texture filters
-static struct {
-    GPU_TEXTURE_FILTER_PARAM magFilter;
-    GPU_TEXTURE_FILTER_PARAM minFilter;
-} textureFilters;
+// Scene
+typedef struct
+{
+    C3D_Mtx     projectionTopLeft;
+    C3D_Mtx     projectionTopRight;
+    C3D_Mtx     projectionBottom;
+}   PP2Di_Scene;
 
 // Cached glyph data
-typedef struct {
+typedef struct
+{
     u8 left;       ///< Horizontal offset to draw the glyph with.
     u8 glyphWidth; ///< Width of the glyph.
     u8 charWidth;  ///< Width of the character, that is, horizontal distance to advance.
-
-    struct {
+    struct
+    {
         float left;
         float right;
         float top;
         float bottom;
     } texcoords; ///< Texcoords in the glyphsheet
-} cachedGlyph_s;
+}   PP2Di_Glyph;
 
-// Cached sysfont
-static struct {
-    u8 cellWidth;    ///< Width of a glyph cell.
-    u8 cellHeight;   ///< Height of a glyph cell.
-    u8 baselinePos;  ///< Vertical position of the baseline.
-    C3D_Tex tex;
-    cachedGlyph_s glyphs[128]; ///< Cache the ascii table
-}   g_sysfontCached;
+// Sysfont
+typedef struct
+{
+    u8      cellWidth;    ///< Width of a glyph cell.
+    u8      cellHeight;   ///< Height of a glyph cell.
+    u8      baselinePos;  ///< Vertical position of the baseline.
+    float   textScale;
+    PP2D_TexRef *   glyphSheets; ///< Non cached sysfont's glyphs
+    PP2D_TexRef     glyphSheetsCache; ///< Texture used for the cache
+    PP2Di_Glyph     glyphs[128]; ///< Glyphs cached
+}   PP2Di_Font;
 
-static void pp2d_use_primitive(GPU_Primitive_t primitive);
-static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty);
-static void pp2d_draw_unprocessed_queue(void);
-static void pp2d_get_text_size_internal(float* width, float* height, float scaleX, float scaleY, int wrapX, const char* text);
-static void pp2d_set_rendered_flags(bool texture, bool text, bool rectangle);
-static void pp2d_set_text_color(u32 color);
+// pp2d context
+typedef struct
+{
+    bool            isInitialized : 1;
+    bool            shapeOutlining : 1;
+    PP2Di_Vbo       vbo;
+    PP2Di_Targets   targets;
+    PP2Di_Shader    shader;
+    PP2Di_Scene     scene;
+    PP2Di_Font      sysfont;
+    PP2Di_TexEnv    texenv;
+    PP2D_TexRef     bindedTex;
+    float           outlineThickness;
+}   PP2Di_Context;
+
+static PP2Di_Context    g_pp2dContext = {0};
+
+// Internal functions
+
+static void             pp2di_cache_sysfont(void);
+static void             pp2d_get_text_size_internal(float* width, float* height, float scaleX, float scaleY, int wrapX, const char* text);
+static PP2D_TexRef      pp2di_new_texture(void);
+
+static inline PP2Di_Vbo *pp2di_get_vbo(void)
+{
+    return &g_pp2dContext.vbo;
+}
+
+static inline void pp2di_update_projection(C3D_Mtx *projection)
+{
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_pp2dContext.shader.projectionLocation, projection);
+}
+
+static inline void pp2di_add_text_vertex(float vx, float vy, float tx, float ty)
+{
+    PP2Di_Vbo * vbo = pp2di_get_vbo();
+
+    PP2Di_Vertex *vertex = &vbo->data[vbo->currentPos++];
+
+    vertex->x = vx;
+    vertex->y = vy;
+    vertex->u = tx;
+    vertex->v = ty;
+}
+
+static inline void pp2di_add_text_vertex_model(float posX, float posY, float texX, float texY, const C3D_Mtx *model)
+{
+    C3D_FVec vec = FVec4_New(posX, posY, 0.f, 1.f);
+
+    pp2di_add_text_vertex(FVec4_Dot(vec, model->r[0]), FVec4_Dot(vec, model->r[1]), texX, texY);
+}
+
+static inline void pp2di_draw_arrays(void)
+{
+    PP2Di_Vbo * vbo = pp2di_get_vbo();
+
+    C3D_DrawArrays(vbo->primitive, vbo->startPos, vbo->currentPos - vbo->startPos);
+    vbo->startPos = vbo->currentPos;
+}
+
+static inline void pp2di_draw_unprocessed_queue(void)
+{
+    PP2Di_Vbo * vbo = pp2di_get_vbo();
+
+    if (vbo->currentPos != vbo->startPos)
+    {
+        C3D_DrawArrays(vbo->primitive, vbo->startPos, vbo->currentPos - vbo->startPos);
+        vbo->startPos = vbo->currentPos;
+    }
+}
+
+static inline void pp2di_use_primitive(GPU_Primitive_t prim)
+{
+    PP2Di_Vbo * vbo = pp2di_get_vbo();
+
+    if (vbo->primitive != prim)
+        pp2di_draw_unprocessed_queue();
+
+    vbo->primitive = prim;
+}
+
+static inline bool pp2di_bind_texture(PP2D_TexRef texture)
+{
+    if (g_pp2dContext.bindedTex != texture)
+    {
+        pp2di_draw_unprocessed_queue();
+        C3D_TexBind(0, (C3D_Tex *)&texture->texture);
+        g_pp2dContext.bindedTex = texture;
+        return true;
+    }
+    return false;
+}
+
+static inline bool pp2di_has_vbo_enough_space(u32 nb)
+{
+    return pp2di_get_vbo()->currentPos + nb < PP2D_MAX_VERTICES;
+}
+
+static inline C3D_TexEnv *pp2di_get_texenv(PP2Di_TexEnv *texenv, PP2Di_TexEnvType type)
+{
+    if (type == TEXTURE_BLENDING) return &texenv->textureBlending;
+    if (type == MIX_COLOR_AND_TEXTURE) return &texenv->mixColorAndTexture;
+    if (type == COLOR_BLENDING) return &texenv->colorBlending;
+
+    return NULL;
+}
+
+static inline void pp2di_set_texenv(PP2Di_TexEnvType type, u32 color)
+{
+    PP2Di_TexEnv    *texenv = &g_pp2dContext.texenv;
+    C3D_TexEnv      *env = pp2di_get_texenv(texenv, texenv->current);
+
+    // If we're changing the settings
+    if (texenv->current != type || (type >= MIX_COLOR_AND_TEXTURE && color != env->color))
+    {
+        // Render any queued vertices with current settings
+        pp2di_draw_unprocessed_queue();
+
+        // Change current env
+        texenv->current = type;
+
+        // Nothing to do if we decided to set NONE (custom settings ?)
+        if (type == NONE) return;
+
+        // Get the suitable env ptr and apply it
+        env = pp2di_get_texenv(texenv, type);
+        if (type >= MIX_COLOR_AND_TEXTURE)
+            env->color = color;
+        C3D_SetTexEnv(0, env);
+    }
+}
 
 static u32 nextPow2(u32 v)
 {
@@ -135,16 +262,249 @@ static u32 nextPow2(u32 v)
     return (v >= TEX_MIN_SIZE ? v : TEX_MIN_SIZE);
 }
 
-static void pp2d_cache_glyphs(void)
+void    pp2d_init(void)
+{
+    gfxInitDefault();
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_ALL);
+    C3D_StencilOp(GPU_STENCIL_KEEP, GPU_STENCIL_KEEP, GPU_STENCIL_REPLACE);
+    //C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_COLOR, GPU_DST_COLOR, GPU_SRC_ALPHA, GPU_DST_ALPHA);
+
+    // Init target
+    {
+        PP2Di_Targets    *targets = &g_pp2dContext.targets;
+        C3D_RenderTarget *target;
+
+        // Top Left
+        target = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_TOP_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+        C3D_RenderTargetSetClear(target, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
+        C3D_RenderTargetSetOutput(target, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+        targets->topLeft = target;
+        
+        // Top Right
+        target = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_TOP_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+        C3D_RenderTargetSetClear(target, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
+        C3D_RenderTargetSetOutput(target, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+        targets->topRight = target;
+        
+        // Bottom
+        target = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_BOTTOM_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+        C3D_RenderTargetSetClear(target, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
+        C3D_RenderTargetSetOutput(target, GFX_BOTTOM, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+        targets->bottom = target;
+    }
+
+    // Init shader
+    {
+        PP2Di_Shader    *shader = &g_pp2dContext.shader;
+
+        shader->vshaderDvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
+        shaderProgramInit(&shader->program);
+        shaderProgramSetVsh(&shader->program, &shader->vshaderDvlb->DVLE[0]);
+        C3D_BindProgram(&shader->program);
+        shader->projectionLocation = shaderInstanceGetUniformLocation(shader->program.vertexShader, "projection");
+    }
+
+    // Init scene
+    {
+        PP2Di_Scene     *scene = &g_pp2dContext.scene;
+
+        Mtx_OrthoTilt(&scene->projectionTopLeft, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+        Mtx_OrthoTilt(&scene->projectionTopRight, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+        Mtx_OrthoTilt(&scene->projectionBottom, 0, PP2D_SCREEN_BOTTOM_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+    }
+
+    // Init vbo
+    {
+        PP2Di_Vbo   * vbo = pp2di_get_vbo();
+        C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
+        C3D_BufInfo * bufInfo = C3D_GetBufInfo();
+
+        AttrInfo_Init(attrInfo);
+        AttrInfo_AddLoader(attrInfo, 0, GPU_FLOAT, 2);
+        AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2);
+
+        vbo->data = (PP2Di_Vertex *)linearAlloc(sizeof(PP2Di_Vertex) * PP2D_MAX_VERTICES);
+        
+        BufInfo_Init(bufInfo);
+        BufInfo_Add(bufInfo, vbo->data, sizeof(PP2Di_Vertex), 2, 0x10);
+    }
+
+    // Init TexEnv
+    {
+        PP2Di_TexEnv *  texenv = & g_pp2dContext.texenv;
+        C3D_TexEnv   *  env;
+
+        // TEXTURE_BLENDING
+        env = &texenv->textureBlending;
+        TexEnv_Init(env);
+        C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, 0, 0);
+        C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+
+        // MIX_COLOR_AND_TEXTURE
+        env = &texenv->mixColorAndTexture;
+        TexEnv_Init(env);
+        C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, 0, 0);
+        C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, 0, 0);
+        C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+
+        // COLOR_BLENDING
+        env = &texenv->colorBlending;
+        TexEnv_Init(env);
+        C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, 0, 0);
+        C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+    }
+
+    // Init Font
+    {
+        fontEnsureMapped();
+
+        TGLP_s      *glyphInfo = fontGetGlyphInfo();
+        PP2Di_Font  *font = &g_pp2dContext.sysfont;        
+        
+        font->glyphSheets = (PP2D_TexRef *)malloc(sizeof(PP2D_TexRef) * glyphInfo->nSheets);
+        for (u32 i = 0; i < glyphInfo->nSheets; ++i)
+        {
+            font->glyphSheets[i] = pp2di_new_texture();
+            C3D_Tex* tex = (C3D_Tex *)&font->glyphSheets[i]->texture;
+            tex->data = fontGetGlyphSheetTex(i);
+            tex->fmt = glyphInfo->sheetFmt;
+            tex->size = glyphInfo->sheetSize;
+            tex->width = glyphInfo->sheetWidth;
+            tex->height = glyphInfo->sheetHeight;
+            tex->param = GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR)
+                | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
+            tex->border = 0;
+            tex->lodParam = 0;
+        }
+
+        font->textScale = 20.f / fontGetCharWidthInfo(fontGlyphIndexFromCodePoint(0x3042))->glyphWidth;
+        pp2di_cache_sysfont();
+    }
+}
+
+void    pp2d_exit(void)
+{    
+    // Clean vbo
+    {
+        PP2Di_Vbo *vbo = pp2di_get_vbo();
+
+        linearFree(vbo->data);
+    }
+
+    // Clean targets
+    {
+        PP2Di_Targets *targets = &g_pp2dContext.targets;
+
+        C3D_RenderTargetDelete(targets->topLeft);
+        C3D_RenderTargetDelete(targets->topRight);
+        C3D_RenderTargetDelete(targets->bottom);
+    }
+
+    // Clean shader
+    {
+        PP2Di_Shader *shader = &g_pp2dContext.shader;
+
+        DVLB_Free(shader->vshaderDvlb);
+        shaderProgramFree(&shader->program);
+    }
+
+    // Clean font
+    {
+        PP2Di_Font  *font = &g_pp2dContext.sysfont;
+
+        // Destroy all textures
+        for (u32 i = 0; i < fontGetGlyphInfo()->nSheets; ++i)
+        {
+            PP2D_TexRef tex = font->glyphSheets[i];
+
+            ((C3D_Tex *)&tex->texture)->data = NULL;
+            pp2d_destroy_texture(tex);
+        }
+        free(font->glyphSheets);
+
+        // Destroy cached texture
+        AtomicDecrement(&font->glyphSheetsCache->refCount);
+        pp2d_destroy_texture(font->glyphSheetsCache);
+    }
+    
+    C3D_Fini();
+    gfxExit();
+}
+
+void    pp2d_set_3D(bool enable)
+{
+    gfxSet3D(enable);
+}
+
+void    pp2d_set_screen_color(gfxScreen_t target, u32 color)
+{
+    PP2Di_Targets *targets = &g_pp2dContext.targets;
+
+    if (target == GFX_TOP)
+    {
+        C3D_RenderTargetSetClear(targets->topLeft, C3D_CLEAR_ALL, color, 0);
+        C3D_RenderTargetSetClear(targets->topRight, C3D_CLEAR_ALL, color, 0);
+    }
+    else
+    {
+        C3D_RenderTargetSetClear(targets->bottom, C3D_CLEAR_ALL, color, 0);
+    }
+}
+
+void    pp2d_frame_begin(gfxScreen_t target, gfx3dSide_t side)
+{
+    PP2Di_Vbo *vbo = pp2di_get_vbo();
+
+    vbo->currentPos = vbo->startPos = 0;
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    pp2d_frame_draw_on(target, side);
+}
+
+void    pp2d_frame_draw_on(gfxScreen_t target, gfx3dSide_t side)
+{
+    pp2di_draw_unprocessed_queue();
+
+    PP2Di_Targets   *targets = &g_pp2dContext.targets;
+    PP2Di_Scene     *scene = &g_pp2dContext.scene;
+
+    if (target == GFX_TOP)
+    {
+        C3D_FrameDrawOn(side == GFX_LEFT ? targets->topLeft : targets->topRight);
+        pp2di_update_projection(side == GFX_LEFT ? &scene->projectionTopLeft : &scene->projectionTopRight);
+    } 
+    else
+    {
+        C3D_FrameDrawOn(targets->bottom);
+        pp2di_update_projection(&scene->projectionBottom);
+    }
+}
+
+void    pp2d_frame_end(void)
+{
+    pp2di_draw_unprocessed_queue();
+    C3D_FrameEnd(0);
+}
+
+static void     pp2di_cache_sysfont(void)
 {
     TGLP_s              *TGLP = fontGetGlyphInfo();
     C3D_RenderTarget    *target;
-    C3D_TexEnv          *env;
-    C3D_Tex             *tex = &g_sysfontCached.tex;
+    PP2Di_Font          *font = &g_pp2dContext.sysfont;
+    PP2D_TexRef         *glyphsheets = font->glyphSheets;
+    C3D_Tex             *tex;
     C3D_Mtx             projection;
     fontGlyphPos_s      data;
     float               left = 0.f;
     float               top = 0.f;
+
+    // Create texture
+    font->glyphSheetsCache = pp2di_new_texture();
+    tex = (C3D_Tex *)&font->glyphSheetsCache->texture;
+    AtomicIncrement(&font->glyphSheetsCache->refCount);
 
     // Init texture for the cache (8 rows of 16 glyphs => 128 glyphs capacity)
     C3D_TexInit(tex, nextPow2(16 * TGLP->cellWidth), nextPow2(8 * TGLP->cellHeight), GPU_RB_RGBA4);
@@ -155,7 +515,7 @@ static void pp2d_cache_glyphs(void)
 
     // Init projection & apply it to vtx shader
     Mtx_Ortho(&projection, 0.f, tex->width, tex->height, 0.f, 0.f, 1.f, true);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_projection, &projection);
+    pp2di_update_projection(&projection);
 
     // Init render target
     target = C3D_RenderTargetCreateFromTex(tex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24);
@@ -166,24 +526,17 @@ static void pp2d_cache_glyphs(void)
     // Init C3D rendering
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C3D_FrameDrawOn(target);
-    vertexData.cur = 0;
-    vertexData.old = 0;
 
     // Set rendering options
-    env = C3D_GetTexEnv(0);
-    C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, 0, 0);
-    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_CONSTANT, 0);
-    C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
-    C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE); ///< Only the alpha is needed actually
-    C3D_TexEnvColor(env, 0);
+    pp2di_set_texenv(TEXTURE_BLENDING, 0);
 
     // Set primitive mode
-    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
+    pp2di_use_primitive(GPU_TRIANGLE_STRIP);
 
     // Init sysfont's globals
-    g_sysfontCached.cellWidth = TGLP->cellWidth;
-    g_sysfontCached.cellHeight = TGLP->cellHeight;
-    g_sysfontCached.baselinePos = TGLP->baselinePos;
+    font->cellWidth = TGLP->cellWidth;
+    font->cellHeight = TGLP->cellHeight;
+    font->baselinePos = TGLP->baselinePos;
 
     // Parse the sysfont and cache the glyphs
     for (u32 i = 0; i < 128; ++i)
@@ -198,7 +551,7 @@ static void pp2d_cache_glyphs(void)
 
         int     glyphIdx = fontGlyphIndexFromCodePoint(i);
         charWidthInfo_s *cwi = fontGetCharWidthInfo(glyphIdx);
-        cachedGlyph_s   *glyph = &g_sysfontCached.glyphs[i];
+        PP2Di_Glyph   *glyph = &font->glyphs[i];
 
         fontCalcGlyphPos(&data, glyphIdx, GLYPH_POS_CALC_VTXCOORD, 1.f, 1.f);
 
@@ -216,19 +569,19 @@ static void pp2d_cache_glyphs(void)
         glyph->texcoords.top = ty;
         glyph->texcoords.bottom = ty - th;
 
-        C3D_TexBind(0, &glyphSheets[data.sheetIndex]);
+        pp2di_bind_texture(glyphsheets[data.sheetIndex]);
 
         data.vtxcoord.left = 0.f;
         data.vtxcoord.right = glyph->glyphWidth;
         data.vtxcoord.top = 0.f;
         data.vtxcoord.bottom = TGLP->cellHeight;
 
-        pp2d_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.bottom, data.texcoord.left, data.texcoord.bottom);
-        pp2d_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
-        pp2d_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.top, data.texcoord.left, data.texcoord.top);
-        pp2d_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.top, data.texcoord.right, data.texcoord.top);
+        pp2di_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.bottom, data.texcoord.left, data.texcoord.bottom);
+        pp2di_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+        pp2di_add_text_vertex(left + data.vtxcoord.left, top + data.vtxcoord.top, data.texcoord.left, data.texcoord.top);
+        pp2di_add_text_vertex(left + data.vtxcoord.right, top + data.vtxcoord.top, data.texcoord.right, data.texcoord.top);
 
-        pp2d_draw_arrays();
+        pp2di_draw_arrays();
     }
 
     // End rendering
@@ -238,68 +591,23 @@ static void pp2d_cache_glyphs(void)
     C3D_RenderTargetDelete(target);
 }
 
-static void pp2d_add_text_vertex(float vx, float vy, float tx, float ty)
-{
-    vertex_s* vtx = &vertexData.vbo[vertexData.cur++];
-    vtx->x = vx;
-    vtx->y = vy;
-    vtx->u = tx;
-    vtx->v = ty;
-}
-
-void pp2d_draw_arrays(void)
-{
-    C3D_DrawArrays(vertexData.primitive, vertexData.old, vertexData.cur - vertexData.old);
-    vertexData.old = vertexData.cur;
-}
-
-static void pp2d_use_primitive(GPU_Primitive_t primitive)
-{
-    // If new primitive type is different, render what's in the queue before switching
-    if (vertexData.primitive != primitive)
-        pp2d_draw_unprocessed_queue();
-
-    vertexData.primitive = primitive;
-}
-
-static void pp2d_draw_unprocessed_queue(void)
-{
-    if (vertexData.cur != vertexData.old)
-    {
-        pp2d_draw_arrays();
-    }
-}
-
 void pp2d_draw_rectangle(int x, int y, int width, int height, u32 color)
 {
-    pp2d_draw_unprocessed_queue();
+    // Check that there's enough space in the vbo
+    if (!pp2di_has_vbo_enough_space(6))
+        return;
 
     // Set primitive mode
-    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
+    pp2di_use_primitive(GPU_TRIANGLE_STRIP);
 
-    if (vertexData.cur + 6 > PP2D_MAX_VERTICES)
-    {
-        return;
-    }
+    // Set rendering options (fragment)
+    pp2di_set_texenv(COLOR_BLENDING, color);
 
-    if (color != prevColor || renderedText || renderedTexture)
-    {
-        prevColor = color;
-        C3D_TexEnv* env = C3D_GetTexEnv(0);
-        C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, GPU_CONSTANT, 0);
-        C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
-        C3D_TexEnvFunc(env, C3D_RGB, GPU_INTERPOLATE);
-        C3D_TexEnvColor(env, color);
-    }
-
-    pp2d_add_text_vertex(        x, y + height, 0, 0);
-    pp2d_add_text_vertex(x + width, y + height, 0, 0);
-    pp2d_add_text_vertex(        x,          y, 0, 0);
-    pp2d_add_text_vertex(x + width,          y, 0, 0);
-
-    pp2d_draw_arrays();
-
-    pp2d_set_rendered_flags(false, false, true);
+    // Send vertices
+    pp2di_add_text_vertex(        x, y + height, 0, 0);
+    pp2di_add_text_vertex(x + width, y + height, 0, 0);
+    pp2di_add_text_vertex(        x,          y, 0, 0);
+    pp2di_add_text_vertex(x + width,          y, 0, 0);
 }
 
 void pp2d_draw_text(float x, float y, float scaleX, float scaleY, u32 color, const char* text)
@@ -311,36 +619,29 @@ void pp2d_draw_text_center(gfxScreen_t target, float y, float scaleX, float scal
 {
     float width = pp2d_get_text_width(text, scaleX, scaleY);
     float x = ((target == GFX_TOP ? PP2D_SCREEN_TOP_WIDTH : PP2D_SCREEN_BOTTOM_WIDTH) - width) / 2;
-    pp2d_draw_text(x, y, scaleX, scaleY, color, text);
+    pp2d_draw_text_wrap(x, y, scaleX, scaleY, color, -1, text);
 }
 
 void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color, float wrapX, const char* text)
 {
     if (text == NULL)
-    {
         return;
-    }
-
-    // Render queue
-    pp2d_draw_unprocessed_queue();
 
     // Set primitive mode
-    pp2d_use_primitive(GPU_TRIANGLE_STRIP);
+    pp2di_use_primitive(GPU_TRIANGLE_STRIP);
 
-    ssize_t  units;
-    uint32_t code;
+    ssize_t     units;
+    uint32_t    code;
+    float       firstX = x;
+    PP2Di_Font *font = &g_pp2dContext.sysfont;
+    PP2D_TexRef *glyphsheets = font->glyphSheets;
     const uint8_t* p = (const uint8_t*)text;
-    float firstX = x;
     
-    scaleX *= s_textScale;
-    scaleY *= s_textScale;
-    lastSheet = -1;
+    scaleX *= font->textScale;
+    scaleY *= font->textScale;
 
-    if (color != prevColor || renderedRectangle || renderedTexture)
-    {
-        prevColor = color;
-        pp2d_set_text_color(color);
-    }
+    // Set rendering settings
+    pp2di_set_texenv(MIX_COLOR_AND_TEXTURE, color);
 
     do
     {
@@ -350,10 +651,10 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
         }
         
         units = decode_utf8(&code, p);
+
         if (units == -1)
-        {
             break;
-        }
+
         p += units;
         
         if (code == '\n' || (wrapX != -1 && x + scaleX * fontGetCharWidthInfo(fontGlyphIndexFromCodePoint(code))->charWidth >= firstX + wrapX))
@@ -364,21 +665,16 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
         }
         else if (code > 0)
         {
-            if (vertexData.cur + 6 > PP2D_MAX_VERTICES)  
-            {
+            if (!pp2di_has_vbo_enough_space(4))
                 break;
-            }
 
             if (code < 128)
             {
-                if (lastSheet != -2)
-                {
-                    pp2d_draw_unprocessed_queue();
-                    C3D_TexBind(0, &g_sysfontCached.tex);
-                    lastSheet = -2;
-                }
+                // Bind the cached texture
+                pp2di_bind_texture(font->glyphSheetsCache);
 
-                cachedGlyph_s   *glyph = &g_sysfontCached.glyphs[code];
+                // Get the glyph
+                PP2Di_Glyph   *glyph = &font->glyphs[code];
 
                 struct
                 {
@@ -389,20 +685,19 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
                 } vtxcoord;
 
                 float vx = scaleX * (float)glyph->left;
-                float vy = 0.f;
                 float vw = scaleX * (float)glyph->glyphWidth;
-                float vh = scaleY * (float)g_sysfontCached.cellHeight;
+                float vh = scaleY * (float)font->cellHeight;
 
-                vy = -vy;
                 vtxcoord.left = vx;
-                vtxcoord.top = vy;
+                vtxcoord.top = 0.f;
                 vtxcoord.right = vx+vw;
-                vtxcoord.bottom = vy+vh;
+                vtxcoord.bottom = vh;
 
-                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);                
-                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.bottom, glyph->texcoords.right, glyph->texcoords.bottom);
-                pp2d_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.top,    glyph->texcoords.left,  glyph->texcoords.top);
-                pp2d_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
+                // Add the vertices
+                pp2di_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.bottom, glyph->texcoords.left,  glyph->texcoords.bottom);                
+                pp2di_add_text_vertex(x+vtxcoord.right, y+vtxcoord.bottom, glyph->texcoords.right, glyph->texcoords.bottom);
+                pp2di_add_text_vertex(x+vtxcoord.left,  y+vtxcoord.top,    glyph->texcoords.left,  glyph->texcoords.top);
+                pp2di_add_text_vertex(x+vtxcoord.right, y+vtxcoord.top,    glyph->texcoords.right, glyph->texcoords.top);
                 
 
                 x += (float)glyph->charWidth * scaleX;
@@ -413,25 +708,22 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
                 fontGlyphPos_s data;
                 fontCalcGlyphPos(&data, glyphIdx, GLYPH_POS_CALC_VTXCOORD, scaleX, scaleY);
 
-                if (data.sheetIndex != lastSheet)
-                {
-                    lastSheet = data.sheetIndex;
-                    pp2d_draw_unprocessed_queue();
-                    C3D_TexBind(0, &glyphSheets[lastSheet]);
-                }
+                // Bind the texture
+                pp2di_bind_texture(glyphsheets[data.sheetIndex]);
 
-                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
-                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
-                pp2d_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
-                pp2d_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);                
+                // Add the vertices
+                pp2di_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.bottom, data.texcoord.left,  data.texcoord.bottom);
+                pp2di_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.bottom, data.texcoord.right, data.texcoord.bottom);
+                pp2di_add_text_vertex(x+data.vtxcoord.left,  y+data.vtxcoord.top,    data.texcoord.left,  data.texcoord.top);
+                pp2di_add_text_vertex(x+data.vtxcoord.right, y+data.vtxcoord.top,    data.texcoord.right, data.texcoord.top);                
 
                 x += data.xAdvance;
             }
         }
     } while (code > 0);
 
-    pp2d_draw_unprocessed_queue();
-    pp2d_set_rendered_flags(false, true, false);
+    // Render the queue
+    pp2di_draw_unprocessed_queue();
 }
 
 void pp2d_draw_textf(float x, float y, float scaleX, float scaleY, u32 color, const char* text, ...) 
@@ -442,71 +734,6 @@ void pp2d_draw_textf(float x, float y, float scaleX, float scaleY, u32 color, co
     vsnprintf(buffer, 256, text, args);
     pp2d_draw_text(x, y, scaleX, scaleY, color, buffer);
     va_end(args);
-}
-
-void pp2d_exit(void)
-{
-    for (size_t id = 0; id < PP2D_MAX_TEXTURES; id++)
-    {
-        pp2d_free_texture(id);
-    }
-    
-    linearFree(vertexData.vbo);
-    free(glyphSheets);
-    
-    shaderProgramFree(&program);
-    DVLB_Free(vshader_dvlb);
-    
-    C3D_Fini();
-    gfxExit();
-}
-
-void pp2d_frame_begin(gfxScreen_t target, gfx3dSide_t side)
-{
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-    vertexData.cur = 0;
-    vertexData.old = 0;
-    pp2d_frame_draw_on(target, side);
-}
-
-void pp2d_frame_draw_on(gfxScreen_t target, gfx3dSide_t side)
-{
-    pp2d_draw_unprocessed_queue();
-
-    if (target == GFX_TOP)
-    {
-        C3D_FrameDrawOn(side == GFX_LEFT ? topLeft : topRight);
-        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_projection, side == GFX_LEFT ? &projectionTopLeft : &projectionTopRight);
-    } 
-    else
-    {
-        C3D_FrameDrawOn(bot);
-        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_projection, &projectionBot);
-    }
-}
-
-void pp2d_frame_end(void)
-{
-    pp2d_draw_unprocessed_queue();
-    C3D_FrameEnd(0);
-}
-
-void pp2d_free_texture(size_t id)
-{
-    if (id >= PP2D_MAX_TEXTURES)
-    {
-        return;
-    }
-    
-    if (!textures[id].allocated)
-    {
-        return;
-    }
-    
-    C3D_TexDelete(&textures[id].tex);
-    textures[id].width = 0;
-    textures[id].height = 0;
-    textures[id].allocated = false;
 }
 
 float pp2d_get_text_height(const char* text, float scaleX, float scaleY)
@@ -540,8 +767,8 @@ static void pp2d_get_text_size_internal(float* width, float* height, float scale
     float firstX = x;
     const uint8_t* p = (const uint8_t*)text;
     
-    scaleX *= s_textScale;
-    scaleY *= s_textScale;
+    scaleX *= g_pp2dContext.sysfont.textScale;
+    scaleY *= g_pp2dContext.sysfont.textScale;
     
     do
     {
@@ -595,352 +822,408 @@ float pp2d_get_text_width(const char* text, float scaleX, float scaleY)
     return width;
 }
 
-void pp2d_init(void)
+u32    pp2di_png_to_texture(C3D_Tex *tex, const char *path)
 {
-    gfxInitDefault();
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
-    
-    topLeft = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_TOP_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
-    C3D_RenderTargetSetClear(topLeft, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
-    C3D_RenderTargetSetOutput(topLeft, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
-    
-    topRight = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_TOP_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
-    C3D_RenderTargetSetClear(topRight, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
-    C3D_RenderTargetSetOutput(topRight, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
-    
-    bot = C3D_RenderTargetCreate(PP2D_SCREEN_HEIGHT, PP2D_SCREEN_BOTTOM_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
-    C3D_RenderTargetSetClear(bot, C3D_CLEAR_ALL, PP2D_DEFAULT_COLOR_BG, 0);
-    C3D_RenderTargetSetOutput(bot, GFX_BOTTOM, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
-    
-    pp2d_set_texture_filter(GPU_NEAREST, GPU_NEAREST);
+    u32 *   imageData = NULL;
+    u32 *   temp = NULL;
+    u32     res = 0;
+    u32     width, height;
+    u32     powWidth, powHeight;
 
-    vshader_dvlb = DVLB_ParseFile((u32*)vshader_shbin, vshader_shbin_size);
-    shaderProgramInit(&program);
-    shaderProgramSetVsh(&program, &vshader_dvlb->DVLE[0]);
-    C3D_BindProgram(&program);
-    uLoc_projection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
-    
-    C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
-    AttrInfo_Init(attrInfo);
-    AttrInfo_AddLoader(attrInfo, 0, GPU_FLOAT, 2);
-    AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2);
+    // Try to load the image
+    if ((res = lodepng_decode32_file((u8 **)&imageData, (unsigned *)&width, (unsigned *)&height, path)) != 0)
+        goto error;
 
-    Mtx_OrthoTilt(&projectionTopLeft, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
-    Mtx_OrthoTilt(&projectionTopRight, 0, PP2D_SCREEN_TOP_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
-    Mtx_OrthoTilt(&projectionBot, 0, PP2D_SCREEN_BOTTOM_WIDTH, PP2D_SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
-    
-    C3D_DepthTest(false, GPU_GEQUAL, GPU_WRITE_ALL);
+    // Adjust size to be a power of 2 (HW restriction)
+    powWidth = nextPow2(width);
+    powHeight = nextPow2(height);
 
-    fontEnsureMapped();
-    TGLP_s* glyphInfo = fontGetGlyphInfo();
-    glyphSheets = malloc(sizeof(C3D_Tex)*glyphInfo->nSheets);
-    for (int i = 0; i < glyphInfo->nSheets; i++)
+    // Allocate a new buffer in the linear memory to be tiled
+    if ((temp = (u32 *)linearAlloc(powWidth * powHeight * 4)) == NULL)
     {
-        C3D_Tex* tex = &glyphSheets[i];
-        tex->data = fontGetGlyphSheetTex(i);
-        tex->fmt = glyphInfo->sheetFmt;
-        tex->size = glyphInfo->sheetSize;
-        tex->width = glyphInfo->sheetWidth;
-        tex->height = glyphInfo->sheetHeight;
-        tex->param = GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR)
-            | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
-        tex->border = 0;
-        tex->lodParam = 0;
+        res = -1;
+        goto error;
     }
 
-    charWidthInfo_s* cwi = fontGetCharWidthInfo(fontGlyphIndexFromCodePoint(0x3042));
-    s_textScale = 20.0f / (cwi->glyphWidth); // 20 is glyphWidth in J machines
+    // Copy the image data and swap the bytes order (RGBA => ABGR)
+    u32 *src = imageData;
+    u32 *end = src + width * height;
+    u32 *dst = temp;
 
-    vertexData.vbo = (vertex_s*)linearAlloc(sizeof(vertex_s)*PP2D_MAX_VERTICES);
-    C3D_BufInfo* bufInfo = C3D_GetBufInfo();
-    BufInfo_Init(bufInfo);
-    BufInfo_Add(bufInfo, vertexData.vbo, sizeof(vertex_s), 2, 0x10);
+    while (src < end)
+        *dst++ = __builtin_bswap32(*src++);
 
-    pp2d_cache_glyphs();
+    // Flush linear memory
+    GSPGPU_FlushDataCache(temp, powWidth * powHeight * 4);
 
-    prevColor = 0;
-    prevSpritesheet = PP2D_MAX_TEXTURES;
-    renderedText = false;
-}
+    // Init the texture
+    C3D_TexInit(tex, powWidth, powHeight, GPU_RGBA8);
+    tex->param = GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR)
+        | GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
+    tex->border = 0;
+    tex->lodParam = 0;
 
-void pp2d_load_texture_memory(size_t id, void* buf, u32 width, u32 height, GX_TRANSFER_FORMAT fmt)
-{
-    GSPGPU_FlushDataCache(buf, width * height * 4);
-    C3D_TexInit(&textures[id].tex, (u16)width, (u16)height, GPU_RGBA8);
-    C3D_SafeDisplayTransfer((u32*)buf, GX_BUFFER_DIM(width, height), (u32*)textures[id].tex.data, GX_BUFFER_DIM(width, height), TEXTURE_TRANSFER_FLAGS(fmt));
+    // Tile the data and transfer it to the texture
+    u32 dim = GX_BUFFER_DIM(powWidth, powHeight);
+    C3D_SafeDisplayTransfer(temp, dim, tex->data, dim, TEXTURE_TRANSFER_FLAGS(GPU_RGBA8));
     gspWaitForPPF();
-    C3D_TexSetFilter(&textures[id].tex, textureFilters.magFilter, textureFilters.minFilter);
-    C3D_TexFlush(&textures[id].tex);
 
-    textures[id].allocated = true;
-    textures[id].width = width;
-    textures[id].height = height;
+    // Flush the texture and we're done
+    C3D_TexFlush(tex);
+
+error:
+    // Free our buffers
+    if (imageData) free(imageData);
+    if (temp) linearFree(temp);
+    return res;
 }
 
-void pp2d_load_texture_png(size_t id, const char* path)
+PP2D_TexRef     pp2di_new_texture(void)
 {
-    if (id >= PP2D_MAX_TEXTURES)
+    static u32  uidCount = 0;
+
+    PP2D_Tex *  tex = (PP2D_Tex *)malloc(sizeof(PP2D_Tex));
+
+    if (!tex)
+        return NULL;
+
+    // Clear the struct
+    memset(tex, 0, sizeof(PP2D_Tex));
+
+    // Set uid
+    tex->uid = ++uidCount;
+
+    return tex;
+}
+
+PP2D_TexRef     pp2d_texture_from_png(const char *path)
+{
+    PP2D_Tex *  tex = (PP2D_Tex *)pp2di_new_texture();
+
+    if (!tex)
+        goto error;
+
+    // Try to load the image
+    if (pp2di_png_to_texture(&tex->texture, path))
+        goto error;
+
+    return tex;
+
+error:
+    if (tex)
     {
+        C3D_TexDelete(&tex->texture);
+        free(tex);
+    }
+
+    return NULL;
+}
+
+void            pp2d_destroy_texture(PP2D_TexRef texture)
+{
+    // If the texture is invalid or in use, abort
+    if (!texture || !texture->uid || AtomicRead(&texture->refCount) > 0)
         return;
-    }
-    
-    u8* image;
-    unsigned width, height;
 
-    lodepng_decode32_file(&image, &width, &height, path);
-    u8* gpusrc = linearAlloc(width*height*4);
+    PP2D_Tex *  tex = (PP2D_Tex *)texture;
 
-    for (u32 i = 0; i < width; i++) 
-    {
-        for (u32 j = 0; j < height; j++) 
-        {
-            const u32 p = (i + j*width) * 4;
+    // Destroy the texture
+    C3D_TexDelete(&tex->texture);
 
-            u8 r = *(u8*)(image + p);
-            u8 g = *(u8*)(image + p + 1);
-            u8 b = *(u8*)(image + p + 2);
-            u8 a = *(u8*)(image + p + 3);
-
-            *(gpusrc + p) = a;
-            *(gpusrc + p + 1) = b;
-            *(gpusrc + p + 2) = g;
-            *(gpusrc + p + 3) = r;
-        }
-    }
-    
-    pp2d_load_texture_memory(id, gpusrc, width, height, GX_TRANSFER_FMT_RGBA8);
-    
-    free(image);
-    linearFree(gpusrc);
+    // Reset uid
+    tex->uid = 0;
 }
 
-void pp2d_load_texture_png_memory(size_t id, void* buf, size_t buf_size)
+PP2D_Sprite *   pp2d_new_sprite_textured(const float posX, const float posY, PP2D_TexRef texture, const PP2D_TexCoords texcoords)
 {
-    if (id >= PP2D_MAX_TEXTURES)
+    // If the texture is invalid, abort
+    if (!texture || !texture->uid)
+        return NULL;
+
+    PP2D_Sprite     *sprite = (PP2D_Sprite *)malloc(sizeof(PP2D_Sprite));
+
+    if (sprite == NULL) return sprite;
+
+    // Clear the struct
+    memset(sprite, 0, sizeof(PP2D_Sprite));
+
+    // Init parameters
+    sprite->updateModel = true;
+    sprite->updateDimensions = false;
+    sprite->destroyTexture = false;
+    sprite->isColoredSprite = false;
+    sprite->_posX = sprite->posX = posX;
+    sprite->_posY = sprite->posY = posY;
+    sprite->_width = sprite->width = texcoords.right - texcoords.left;
+    sprite->_height = sprite->height = texcoords.bottom - texcoords.top;
+    sprite->scaleX = 1.f;
+    sprite->scaleY = 1.f;
+    sprite->color = (PP2D_Color){0xFFFFFFFF};
+    sprite->rotation = Quat_Identity();
+
+    // Init texture
+    sprite->texture = texture;
+    AtomicIncrement(&texture->refCount);
+
+    float           texWidth = (float)texture->texture.width;
+    float           texHeight = (float)texture->texture.height;
+    PP2D_TexCoords *texCoords = &sprite->texcoords;
+
+    texCoords->left = texcoords.left / texWidth;
+    texCoords->right = texCoords->left + sprite->width / texWidth;
+    texCoords->top = 1.f - texcoords.top / texHeight;
+    texCoords->bottom = texCoords->top - sprite->height / texHeight;
+
+    return sprite;
+}
+
+PP2D_Sprite *   pp2d_new_sprite_colored(const float posX, const float posY, const float width, const float height, const PP2D_Color color)
+{
+    PP2D_Sprite     *sprite = (PP2D_Sprite *)malloc(sizeof(PP2D_Sprite));
+
+    if (sprite == NULL) return sprite;
+
+    // Clear the struct
+    memset(sprite, 0, sizeof(PP2D_Sprite));
+
+    // Init parameters
+    sprite->updateModel = true;
+    sprite->updateDimensions = false;
+    sprite->destroyTexture = false;
+    sprite->isColoredSprite = true;
+    sprite->_posX = sprite->posX = posX;
+    sprite->_posY = sprite->posY = posY;
+    sprite->_width = sprite->width = width;
+    sprite->_height = sprite->height = height;
+    sprite->scaleX = 1.f;
+    sprite->scaleY = 1.f;
+    sprite->color = color;
+    sprite->rotation = Quat_Identity();
+    sprite->texture = NULL;
+
+    return sprite;
+}
+
+PP2D_Sprite *   pp2d_sprite_move(PP2D_Sprite *sprite, const float offsetX, const float offsetY)
+{
+    if (!sprite) goto exit;
+
+    // Update the "real" position
+    sprite->_posX += offsetX;
+    sprite->_posY += offsetY;
+
+    // Update the "scaled" position
+    sprite->posX += offsetX;
+    sprite->posY += offsetY;
+
+    sprite->updateModel = true;
+
+exit:
+    return sprite;
+}
+
+PP2D_Sprite *   pp2d_sprite_rotate(PP2D_Sprite *sprite, const float degrees)
+{
+    if (!sprite) goto exit;
+
+    sprite->rotation = Quat_RotateZ(sprite->rotation, C3D_AngleFromDegrees(degrees), false);
+
+    sprite->updateModel = true;
+
+exit:
+    return sprite;
+}
+
+PP2D_Sprite *   pp2d_sprite_scale(PP2D_Sprite *sprite, const float scaleX, const float scaleY)
+{
+    if (!sprite) goto exit;
+
+    sprite->scaleX += scaleX;
+    sprite->scaleY += scaleY;
+
+    if (sprite->scaleX < 0.f)
+        sprite->scaleX = 0.f; 
+
+    if (sprite->scaleY < 0.f)
+        sprite->scaleY = 0.f; 
+
+    sprite->updateDimensions = true;
+    sprite->updateModel = true;
+
+exit:
+    return sprite;
+}
+
+PP2D_Sprite *   pp2d_sprite_update(PP2D_Sprite *sprite)
+{
+    if (!sprite) goto exit;
+
+    if (sprite->updateDimensions)
     {
-        return;
+        float   width = sprite->_width;
+        float   height = sprite->_height;
+
+        // Update dimensions
+        sprite->width = width * sprite->scaleX;
+        sprite->height = height * sprite->scaleY;
+
+        // Update positions
+        sprite->posX = sprite->_posX + (width - sprite->width) / 2.f;
+        sprite->posY = sprite->_posY + (height - sprite->height) / 2.f;
+
+        sprite->updateDimensions = false;
     }
-    
-    u8* image;
-    unsigned width, height;
 
-    lodepng_decode32(&image, &width, &height, buf, buf_size);
-    u8* gpusrc = linearAlloc(width*height*4);
-
-    for (u32 i = 0; i < width; i++) 
+    if (sprite->updateModel)
     {
-        for (u32 j = 0; j < height; j++) 
-        {
-            const u32 p = (i + j*width) * 4;
+        C3D_Mtx     model;
+        C3D_Mtx     rotation;
+        C3D_Mtx     scale;
+        float       xCenter = sprite->_width / 2.f;
+        float       yCenter = sprite->_height / 2.f;
 
-            u8 r = *(u8*)(image + p);
-            u8 g = *(u8*)(image + p + 1);
-            u8 b = *(u8*)(image + p + 2);
-            u8 a = *(u8*)(image + p + 3);
+        Mtx_Identity(&model);
+        Mtx_Translate(&model, -xCenter, -yCenter, -0.5f, false);
 
-            *(gpusrc + p) = a;
-            *(gpusrc + p + 1) = b;
-            *(gpusrc + p + 2) = g;
-            *(gpusrc + p + 3) = r;
-        }
+        Mtx_Identity(&scale);
+        Mtx_Scale(&scale, sprite->scaleX, sprite->scaleY, 0.f);
+
+        Mtx_FromQuat(&rotation, sprite->rotation);
+
+        Mtx_Multiply(&rotation, &rotation, &scale);
+        Mtx_Multiply(&model, &rotation, &model);
+        Mtx_Translate(&model, sprite->_posX + xCenter, sprite->_posY + yCenter, 0.5f, false);
+        Mtx_Copy(&sprite->model, &model);
+
+        sprite->updateModel = false;
     }
-    
-    pp2d_load_texture_memory(id, gpusrc, width, height, GX_TRANSFER_FMT_RGBA8);
-    
-    free(image);
-    linearFree(gpusrc);
+
+exit:
+    return sprite;
 }
 
-void pp2d_set_3D(bool enable)
+PP2D_Sprite *   pp2d_sprite_draw(PP2D_Sprite *sprite)
 {
-    gfxSet3D(enable);
-}
+    if (!sprite || !pp2di_has_vbo_enough_space(6)) return sprite;
 
-static void pp2d_set_rendered_flags(bool texture, bool text, bool rectangle)
-{
-    renderedTexture = texture;
-    renderedText = text;
-    renderedRectangle = rectangle;
-}
+    /*if (sprite->updateModel) ///< Force it or not force it ?
+        pp2d_sprite_update(sprite); */
 
-void pp2d_set_screen_color(gfxScreen_t target, u32 color)
-{
-    if (target == GFX_TOP)
+    bool            outlining = g_pp2dContext.shapeOutlining;
+    float           width = sprite->_width;
+    float           height = sprite->_height;
+    float           left = 0.f, top = 0.f;
+    C3D_Mtx         scaled;
+    C3D_Mtx *       modelMtx = &sprite->model;
+    PP2D_TexCoords *texcoords = &sprite->texcoords;
+
+    // If we're in outlining mode
+    if (outlining)
     {
-        C3D_RenderTargetSetClear(topLeft, C3D_CLEAR_ALL, color, 0);
-        C3D_RenderTargetSetClear(topRight, C3D_CLEAR_ALL, color, 0);
+        float       scale = g_pp2dContext.outlineThickness;
+
+        C3D_Mtx     model;
+        C3D_Mtx     scaleMtx;
+        C3D_Mtx     rotation;
+        float       xCenter = width / 2.f;
+        float       yCenter = width / 2.f;
+
+        Mtx_Identity(&model);
+        Mtx_Translate(&model, -xCenter, -yCenter, 0.f, false);
+
+        Mtx_Identity(&scaleMtx);
+        Mtx_Scale(&scaleMtx, sprite->scaleX + scale, sprite->scaleY + scale, 0.f);
+
+        Mtx_FromQuat(&rotation, sprite->rotation);
+
+        Mtx_Multiply(&rotation, &rotation, &scaleMtx);
+        Mtx_Multiply(&scaled, &rotation, &model);
+        Mtx_Translate(&scaled, sprite->_posX + xCenter, sprite->_posY + yCenter, 0.f, false);
+
+        modelMtx = &scaled;
     }
     else
     {
-        C3D_RenderTargetSetClear(bot, C3D_CLEAR_ALL, color, 0);
-    }
-}
-
-static void pp2d_set_text_color(u32 color)
-{
-    C3D_TexEnv* env = C3D_GetTexEnv(0);
-    C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, 0, 0);
-    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_CONSTANT, 0);
-    C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
-    C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE);
-    C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
-    C3D_TexEnvColor(env, color);
-}
-
-void pp2d_set_texture_filter(GPU_TEXTURE_FILTER_PARAM magFilter, GPU_TEXTURE_FILTER_PARAM minFilter)
-{
-    textureFilters.magFilter = magFilter;
-    textureFilters.minFilter = minFilter;
-}
-
-void pp2d_texture_select_part(size_t id, int x, int y, int xbegin, int ybegin, int width, int height)
-{
-    if (id >= PP2D_MAX_TEXTURES)
-    {
-        pp2dBuffer.initialized = false;
-        return;
-    }
-    
-    pp2dBuffer.id = id;
-    pp2dBuffer.x = x;
-    pp2dBuffer.y = y;
-    pp2dBuffer.xbegin = xbegin;
-    pp2dBuffer.ybegin = ybegin;
-    pp2dBuffer.width = width;
-    pp2dBuffer.height = height;
-    pp2dBuffer.color = PP2D_DEFAULT_COLOR_NEUTRAL;
-    pp2dBuffer.fliptype = PP2D_FLIP_NONE;
-    pp2dBuffer.scaleX = 1;
-    pp2dBuffer.scaleY = 1;
-    pp2dBuffer.angle = 0;
-    pp2dBuffer.initialized = true;
-}
-
-void pp2d_texture_blend(u32 color)
-{
-    pp2dBuffer.color = color;
-}
-
-void pp2d_texture_flip(flipType_t fliptype)
-{
-    pp2dBuffer.fliptype = fliptype;
-}
-
-void pp2d_texture_queue(void)
-{
-    if (!pp2dBuffer.initialized || vertexData.cur + 6 > PP2D_MAX_VERTICES)
-    {
-        return;
-    }
-    
-    size_t id = pp2dBuffer.id;
-    
-    // Set primitive mode
-    pp2d_use_primitive(GPU_TRIANGLES);
-
-    float left = (float)pp2dBuffer.xbegin / (float)textures[id].tex.width;
-    float right = (float)(pp2dBuffer.xbegin + pp2dBuffer.width) / (float)textures[id].tex.width;
-    float top = (float)(textures[id].tex.height - pp2dBuffer.ybegin) / (float)textures[id].tex.height;
-    float bottom = (float)(textures[id].tex.height - pp2dBuffer.ybegin - pp2dBuffer.height) / (float)textures[id].tex.height;
-    
-    // scaling
-    pp2dBuffer.height *= pp2dBuffer.scaleY;
-    pp2dBuffer.width *= pp2dBuffer.scaleX;
-    float vert[6][2] = {
-        {                   pp2dBuffer.x,                     pp2dBuffer.y},
-        {                   pp2dBuffer.x, pp2dBuffer.y + pp2dBuffer.height},
-        {pp2dBuffer.width + pp2dBuffer.x,                     pp2dBuffer.y},
-        {pp2dBuffer.width + pp2dBuffer.x,                     pp2dBuffer.y},
-        {                   pp2dBuffer.x, pp2dBuffer.y + pp2dBuffer.height},
-        {pp2dBuffer.width + pp2dBuffer.x, pp2dBuffer.y + pp2dBuffer.height},
-    };
-
-    // flipping
-    if (pp2dBuffer.fliptype == PP2D_FLIP_BOTH || pp2dBuffer.fliptype == PP2D_FLIP_HORI)
-    {
-        float tmp = left;
-        left = right;
-        right = tmp;
-    }
-    if (pp2dBuffer.fliptype == PP2D_FLIP_BOTH || pp2dBuffer.fliptype == PP2D_FLIP_VERT)
-    {
-        float tmp = top;
-        top = bottom;
-        bottom = tmp;
-    }
-    
-    // rotating
-    pp2dBuffer.angle = fmod(pp2dBuffer.angle, 360);
-    if (pp2dBuffer.angle != 0)
-    {
-        const float rad = pp2dBuffer.angle/(180/M_PI);
-        const float c = cosf(rad);
-        const float s = sinf(rad);
-        
-        const float xcenter = pp2dBuffer.x + pp2dBuffer.width/2.0f;
-        const float ycenter = pp2dBuffer.y + pp2dBuffer.height/2.0f;
-        
-        for (int i = 0; i < 6; i++)
+        // If this sprite is a colored shape
+        if (sprite->isColoredSprite)
+            pp2di_set_texenv(MIX_COLOR_AND_TEXTURE, sprite->color.raw);
+        else ///< Textured sprite
         {
-            float oldx = vert[i][0];
-            float oldy = vert[i][1];
-            
-            vert[i][0] = c * (oldx - xcenter) - s * (oldy - ycenter) + xcenter;
-            vert[i][1] = s * (oldx - xcenter) + c * (oldy - ycenter) + ycenter;
+            // Bind texture and set tex env
+            pp2di_bind_texture(sprite->texture);
+            pp2di_set_texenv(TEXTURE_BLENDING, 0);
         }
     }
 
-    const bool changeSheet = id != prevSpritesheet;
-    const bool changeColor = pp2dBuffer.color != prevColor;
-    // draw the remaining vertices in the queue before changing data
-    if ((changeSheet || changeColor) && (vertexData.cur > 0))
-    {
-        pp2d_draw_arrays();
-    }
+    // Draw sprite
+    pp2di_use_primitive(GPU_TRIANGLES);
+    
+    // Add vertices to draw queue
+    pp2di_add_text_vertex_model(left, top, texcoords->left, texcoords->top, modelMtx);
+    pp2di_add_text_vertex_model(left, height, texcoords->left, texcoords->bottom, modelMtx);
+    pp2di_add_text_vertex_model(width, height, texcoords->right, texcoords->bottom, modelMtx);
 
-    // binding
-    if (changeSheet || renderedText)
-    {
-        prevSpritesheet = id;
-        C3D_TexBind(0, &textures[id].tex);
-        renderedText = false;
-    }
+    pp2di_add_text_vertex_model(width, height, texcoords->right, texcoords->bottom, modelMtx);
+    pp2di_add_text_vertex_model(width, top, texcoords->right, texcoords->top, modelMtx);        
+    pp2di_add_text_vertex_model(left, top, texcoords->left, texcoords->top, modelMtx);
 
-    // blending
-    if (changeColor)
-    {
-        prevColor = pp2dBuffer.color;
-        C3D_TexEnv* env = C3D_GetTexEnv(0);
-        C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_CONSTANT, 0);
-        C3D_TexEnvOp(env, C3D_Both, 0, 0, 0);
-        C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
-        C3D_TexEnvColor(env, pp2dBuffer.color);
-    }
-
-    // rendering
-    pp2d_add_text_vertex(vert[0][0], vert[0][1], left, top);
-    pp2d_add_text_vertex(vert[1][0], vert[1][1], left, bottom);
-    pp2d_add_text_vertex(vert[2][0], vert[2][1], right, top);
-    pp2d_add_text_vertex(vert[3][0], vert[3][1], right, top);
-    pp2d_add_text_vertex(vert[4][0], vert[4][1], left, bottom);
-    pp2d_add_text_vertex(vert[5][0], vert[5][1], right, bottom);
-
-    pp2d_set_rendered_flags(true, false, false);
+    return sprite;
 }
 
-void pp2d_texture_position(int x, int y)
+void            pp2d_destroy_sprite(PP2D_Sprite *sprite)
 {
-    pp2dBuffer.x = x;
-    pp2dBuffer.y = y;
+    if (!sprite) return;
+
+    // Decrease texture's refCount
+    if (sprite->texture)
+        AtomicDecrement(&sprite->texture->refCount);
+
+    // Destroy texture if needed
+    if (sprite->destroyTexture)
+        pp2d_destroy_texture(sprite->texture);
+
+    // Clear structure
+    memset(sprite, 0, sizeof(PP2D_Sprite));
+
+    // Relese resources
+    free(sprite);   
 }
 
-void pp2d_texture_rotate(float angle)
+void            pp2d_shape_outlining_begin(void)
 {
-    pp2dBuffer.angle = angle;
+    // Enable stencil
+    C3D_StencilTest(true, GPU_ALWAYS, 1, 0xFF, 0xFF);
+    // Enable alpha test
+    C3D_AlphaTest(true, GPU_GREATER, 0); 
 }
 
-void pp2d_texture_scale(float scaleX, float scaleY)
+void            pp2d_shape_outlining_apply(const PP2D_Color color, float thickness)
 {
-    pp2dBuffer.scaleX = scaleX;
-    pp2dBuffer.scaleY = scaleY;
+    // Render queue
+    pp2di_draw_unprocessed_queue();
+
+    // Enable shape outlining and set thickness
+    g_pp2dContext.shapeOutlining = true;
+    g_pp2dContext.outlineThickness = thickness / 100.f;
+
+    // Disable Alpha test
+    C3D_AlphaTest(false, GPU_GREATER, 0);
+
+    // Change stencil test
+    C3D_StencilTest(true, GPU_NOTEQUAL, 1, 0xFF, 0x00);
+
+    // Configure tex env
+    pp2di_set_texenv(MIX_COLOR_AND_TEXTURE, color.raw);
+}
+
+void        pp2d_shape_outlining_end(void)
+{
+    // Render queue
+    pp2di_draw_unprocessed_queue();
+
+    // Disable shape outlining
+    g_pp2dContext.shapeOutlining = false;
+
+    // Disable stencil test
+    C3D_StencilTest(false, GPU_ALWAYS, 1, 0xFF, 0xFF);
 }

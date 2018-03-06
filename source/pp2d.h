@@ -95,11 +95,9 @@ extern "C" {
 #define PP2D_DEFAULT_COLOR_BG ABGR8(255, 0, 0, 0)
 #define PP2D_DEFAULT_COLOR_NEUTRAL RGBA8(255, 255, 255, 255)
 #define PP2D_DEFAULT_DEPTH 0.5f
-#define PP2D_MAX_VERTICES 12288
+#define PP2D_MAX_VERTICES 0x4000
 
-#ifndef PP2D_MAX_TEXTURES 
-#define PP2D_MAX_TEXTURES 1
-#endif
+#define AtomicRead(ptr) __atomic_load_n((u32 *)(ptr), __ATOMIC_SEQ_CST)
 
 typedef enum {
     PP2D_FLIP_NONE,
@@ -108,13 +106,108 @@ typedef enum {
     PP2D_FLIP_BOTH
 } flipType_t;
 
-typedef struct { 
-    float x, y; 
-    float u, v;
-} vertex_s;
+typedef union
+{
+    u32         raw;
+    struct
+    {
+        u8      r;
+        u8      g;
+        u8      b;
+        u8      a;
+    };
+}           PP2D_Color;
 
-/// Draws queued vertices
-void pp2d_draw_arrays(void);
+typedef struct
+{
+    float left, top, right, bottom;
+}           PP2D_TexCoords;
+
+typedef struct
+{
+    u32         uid;
+    u32         refCount;
+    C3D_Tex     texture;
+}           PP2D_Tex;
+
+typedef const PP2D_Tex * PP2D_TexRef;
+
+typedef struct
+{
+    struct
+    {
+        bool        updateModel : 1;
+        bool        updateDimensions : 1;
+        bool        destroyTexture : 1;
+        bool        isColoredSprite : 1;
+    };
+
+    float           posX,   posY;
+    float           _posX, _posY;
+    float           width,  height;
+    float           _width, _height;
+    float           scaleX, scaleY;
+    PP2D_Color      color;
+    PP2D_TexRef     texture;
+    PP2D_TexCoords  texcoords;
+    C3D_FQuat       rotation;
+    C3D_Mtx         model;
+}           PP2D_Sprite;
+
+PP2D_TexRef     pp2d_texture_from_png(const char *path);
+void            pp2d_destroy_texture(PP2D_TexRef texture);
+
+PP2D_Sprite *   pp2d_new_sprite_textured(const float posX, const float posY, PP2D_TexRef texture, const PP2D_TexCoords texpos);
+PP2D_Sprite *   pp2d_new_sprite_colored(const float posX, const float posY, const float width, const float height, const PP2D_Color color);
+PP2D_Sprite *   pp2d_sprite_move(PP2D_Sprite *sprite, const float offsetX, const float offsetY);
+PP2D_Sprite *   pp2d_sprite_rotate(PP2D_Sprite *sprite, const float degrees);
+PP2D_Sprite *   pp2d_sprite_scale(PP2D_Sprite *sprite, const float scaleX, const float scaleY);
+PP2D_Sprite *   pp2d_sprite_update(PP2D_Sprite *sprite);
+PP2D_Sprite *   pp2d_sprite_draw(PP2D_Sprite *sprite);
+void            pp2d_destroy_sprite(PP2D_Sprite *sprite);
+
+void            pp2d_shape_outlining_begin(void);
+void            pp2d_shape_outlining_apply(const PP2D_Color color, float thickness);
+void            pp2d_shape_outlining_end(void);
+
+/**
+ * @brief Inits the pp2d environment
+ * @note This will trigger gfxInitDefault by default 
+ */
+void pp2d_init(void);
+
+/// Frees the pp2d environment
+void pp2d_exit(void);
+
+/**
+ * @brief Enables 3D service
+ * @param enable integer
+ */
+void pp2d_set_3D(bool enable);
+
+/**
+ * @brief Sets a background color for the specified screen
+ * @param target GFX_TOP or GFX_BOTTOM
+ * @param color ABGR8 which will be the background one
+ */
+void pp2d_set_screen_color(gfxScreen_t target, u32 color);
+
+/**
+ * @brief Starts a new frame on the specified screen
+ * @param target GFX_TOP or GFX_BOTTOM
+ * @param side GFX_LEFT or GFX_RIGHT
+ */
+void pp2d_frame_begin(gfxScreen_t target, gfx3dSide_t side);
+
+/**
+ * @brief Changes target screen to the specified target
+ * @param target GFX_TOP or GFX_BOTTOM
+ * @param side GFX_LEFT or GFX_RIGHT
+ */
+void pp2d_frame_draw_on(gfxScreen_t target, gfx3dSide_t side);
+
+/// Ends a frame
+void pp2d_frame_end(void);
 
 /**
  * @brief Draws a rectangle
@@ -172,32 +265,6 @@ void pp2d_draw_text_wrap(float x, float y, float scaleX, float scaleY, u32 color
  */
 void pp2d_draw_textf(float x, float y, float scaleX, float scaleY, u32 color, const char* text, ...); 
 
-/// Frees the pp2d environment
-void pp2d_exit(void);
-
-/**
- * @brief Starts a new frame on the specified screen
- * @param target GFX_TOP or GFX_BOTTOM
- * @param side GFX_LEFT or GFX_RIGHT
- */
-void pp2d_frame_begin(gfxScreen_t target, gfx3dSide_t side);
-
-/**
- * @brief Changes target screen to the specified target
- * @param target GFX_TOP or GFX_BOTTOM
- * @param side GFX_LEFT or GFX_RIGHT
- */
-void pp2d_frame_draw_on(gfxScreen_t target, gfx3dSide_t side);
-
-/// Ends a frame
-void pp2d_frame_end(void);
-
-/**
- * @brief Frees a texture
- * @param id of the texture to free
- */
-void pp2d_free_texture(size_t id);
-
 /**
  * @brief Calculates a char pointer height
  * @param text char pointer to calculate the height of
@@ -235,110 +302,6 @@ void pp2d_get_text_size(float* width, float* height, float scaleX, float scaleY,
  * @return width the text will have if rendered in the supplied conditions
  */
 float pp2d_get_text_width(const char* text, float scaleX, float scaleY);
-
-/**
- * @brief Inits the pp2d environment
- * @note This will trigger gfxInitDefault by default 
- */
-void pp2d_init(void);
-
-/**
- * @brief Loads a texture from a a buffer in memory
- * @param id of the texture 
- * @param buf buffer where the texture is stored
- * @param width of the texture
- * @param height of the 
- * @param fmt GX_TRANSFER_FORMAT to use
- */
-void pp2d_load_texture_memory(size_t id, void* buf, u32 width, u32 height, GX_TRANSFER_FORMAT fmt);
-
-/**
- * @brief Loads a texture from a png file
- * @param id of the texture 
- * @param path where the png file is located 
- */
-void pp2d_load_texture_png(size_t id, const char* path);
-
-/**
- * @brief Loads a texture from a buffer in memory
- * @param id of the texture
- * @param buf buffer where the png is stored
- * @param buf_size size of buffer
- */
-void pp2d_load_texture_png_memory(size_t id, void* buf, size_t buf_size);
-
-/**
- * @brief Enables 3D service
- * @param enable integer
- */
-void pp2d_set_3D(bool enable);
-
-/**
- * @brief Sets a background color for the specified screen
- * @param target GFX_TOP or GFX_BOTTOM
- * @param color ABGR8 which will be the background one
- */
-void pp2d_set_screen_color(gfxScreen_t target, u32 color);
-
-/**
- * @brief Sets filters to load texture with
- * @param magFilter GPU_NEAREST or GPU_LINEAR
- * @param minFilter GPU_NEAREST or GPU_LINEAR
- */
-void pp2d_set_texture_filter(GPU_TEXTURE_FILTER_PARAM magFilter, GPU_TEXTURE_FILTER_PARAM minFilter);
-
-/**
- * @brief Inits a portion of a texture to be drawn
- * @param id of the texture 
- * @param x position on the screen to draw the texture
- * @param y position on the screen to draw the texture
- * @param xbegin position to start drawing
- * @param ybegin position to start drawing
- * @param width to draw from the xbegin position 
- * @param height to draw from the ybegin position
- */
-void pp2d_texture_select_part(size_t id, int x, int y, int xbegin, int ybegin, int width, int height);
-
-/**
- * @brief Sets a color to blend textures with
- * @param color to modulate the texture
- */
-void pp2d_texture_blend(u32 color);
-
-/**
- * @brief Sets the depth of a texture
- * @param depth factor of the texture
- */
-void pp2d_texture_depth(float depth);
-
-/**
- * @brief Flips a texture
- * @param fliptype HORIZONTAL, VERTICAL or BOTH
- */
-void pp2d_texture_flip(flipType_t fliptype);
-
-/// Queues a texture
-void pp2d_texture_queue(void);
-
-/**
- * @brief Sets the position to draw the texture to
- * @param x position
- * @param y position
- */
-void pp2d_texture_position(int x, int y);
-
-/**
- * @brief Rotates a texture
- * @param angle in degrees to rotate the texture
- */
-void pp2d_texture_rotate(float angle);
-
-/**
- * @brief Scales a texture
- * @param scaleX width scale factor
- * @param scaleY height scale factor
- */
-void pp2d_texture_scale(float scaleX, float scaleY);
 
 #ifdef __cplusplus
 }

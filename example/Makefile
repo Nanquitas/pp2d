@@ -145,6 +145,9 @@ clean:
 	@echo clean ...
 	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
 
+link:
+	@3dslink.exe -a 192.168.1.5 $(TARGET).3dsx 
+
 
 #---------------------------------------------------------------------------------
 else
