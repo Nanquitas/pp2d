@@ -39,8 +39,12 @@ void initBalls(PP2D_TexRef texture, ball_t *ball)
         float   texRight = texLeft + BALL_WIDTH;
         float   texBottom = texTop + BALL_HEIGHT;
         float   scale = ((float)(rand() % 100) - 50.f) / 100.f;
+        // PP2D_Color color = { .a = 255, .r = rand() % 255, .g = rand() % 255, .b = rand() % 255};
 
-        ball->sprite = pp2d_new_sprite_textured(posX, posY, texture, (PP2D_TexCoords){ texLeft, texTop, texRight, texBottom });
+        //if (i % 2)
+            ball->sprite = pp2d_new_sprite_textured(posX, posY, texture, (PP2D_TexCoords){ texLeft, texTop, texRight, texBottom });
+        //else
+        //    ball->sprite = pp2d_new_sprite_colored(posX, posY, BALL_WIDTH, BALL_HEIGHT, color);
         ball->velocityX = rand() % 100;
         ball->velocityY = rand() % 100;
         ball->rotationalSpeed = (float)(rand() % 4) * 360.f;

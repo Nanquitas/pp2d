@@ -130,6 +130,7 @@ typedef struct
     PP2Di_TexEnv    texenv;
     PP2D_TexRef     bindedTex;
     float           outlineThickness;
+    PP2D_Color      outlineColor;
 }   PP2Di_Context;
 
 static PP2Di_Context    g_pp2dContext = {0};
@@ -1141,12 +1142,15 @@ PP2D_Sprite *   pp2d_sprite_draw(PP2D_Sprite *sprite)
         Mtx_Translate(&scaled, sprite->_posX + xCenter, sprite->_posY + yCenter, 0.f, false);
 
         modelMtx = &scaled;
+
+        // Configure tex env
+        pp2di_set_texenv(sprite->isColoredSprite ? COLOR_BLENDING : MIX_COLOR_AND_TEXTURE, g_pp2dContext.outlineColor.raw);
     }
     else
     {
         // If this sprite is a colored shape
         if (sprite->isColoredSprite)
-            pp2di_set_texenv(MIX_COLOR_AND_TEXTURE, sprite->color.raw);
+            pp2di_set_texenv(COLOR_BLENDING, sprite->color.raw);
         else ///< Textured sprite
         {
             // Bind texture and set tex env
@@ -1205,15 +1209,13 @@ void            pp2d_shape_outlining_apply(const PP2D_Color color, float thickne
     // Enable shape outlining and set thickness
     g_pp2dContext.shapeOutlining = true;
     g_pp2dContext.outlineThickness = thickness / 100.f;
+    g_pp2dContext.outlineColor = color;
 
     // Disable Alpha test
     C3D_AlphaTest(false, GPU_GREATER, 0);
 
     // Change stencil test
     C3D_StencilTest(true, GPU_NOTEQUAL, 1, 0xFF, 0x00);
-
-    // Configure tex env
-    pp2di_set_texenv(MIX_COLOR_AND_TEXTURE, color.raw);
 }
 
 void        pp2d_shape_outlining_end(void)
